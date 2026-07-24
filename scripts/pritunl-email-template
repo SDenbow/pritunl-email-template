@@ -1,0 +1,328 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+PROGRAM="pritunl-email-template"
+VERSION="1.0.0"
+BACKUP_DIR="/root/pritunl-email-template-backups"
+SERVICE_NAME="pritunl"
+DEFAULT_INSTALL_ROOT="/usr/lib/pritunl/usr/lib"
+
+URL=""
+MODE="apply"
+RESTART_MODE="prompt"
+ASSUME_YES=false
+CONSTANTS_FILE=""
+RESTORE_FILE=""
+
+log() { printf '[%(%Y-%m-%d %H:%M:%S)T] %s\n' -1 "$*"; }
+die() { log "ERROR: $*" >&2; exit 1; }
+
+usage() {
+  cat <<USAGE
+Usage: ${PROGRAM} [options]
+
+Safely add or update a VPN setup guide link in Pritunl onboarding emails.
+
+Options:
+  --url URL                 Help-page hostname or full URL.
+  --check                   Report current customization state; change nothing.
+  --restart                 Restart Pritunl after a successful change.
+  --no-restart              Do not restart Pritunl after a successful change.
+  --constants-file PATH     Use a specific Pritunl constants.py file.
+  --list-backups            List available constants.py backups.
+  --restore PATH            Restore a specific backup after validation.
+  --yes, -y                 Accept confirmation prompts.
+  --version                 Show version.
+  --help, -h                Show this help.
+USAGE
+}
+
+require_root() {
+  (( EUID == 0 )) || die "Run this command as root."
+}
+
+normalize_url() {
+  local value="$1"
+  value="${value#${value%%[![:space:]]*}}"
+  value="${value%${value##*[![:space:]]}}"
+  [[ -n "$value" ]] || die "The help URL cannot be empty."
+  if [[ ! "$value" =~ ^https?:// ]]; then
+    value="https://${value}"
+  fi
+  python3 - "$value" <<'PY'
+import sys
+from urllib.parse import urlsplit
+url = sys.argv[1]
+parts = urlsplit(url)
+if parts.scheme not in {"http", "https"} or not parts.netloc:
+    raise SystemExit("Invalid URL. Supply a hostname or an http/https URL.")
+if any(ch.isspace() for ch in url):
+    raise SystemExit("Invalid URL: whitespace is not allowed.")
+print(url.rstrip('/'))
+PY
+}
+
+confirm() {
+  local prompt="$1" answer
+  $ASSUME_YES && return 0
+  read -r -p "${prompt} [y/N] " answer
+  [[ "$answer" =~ ^[Yy]([Ee][Ss])?$ ]]
+}
+
+find_constants_file() {
+  local -a candidates=()
+  local f
+  if [[ -n "$CONSTANTS_FILE" ]]; then
+    [[ -f "$CONSTANTS_FILE" ]] || die "constants.py not found: $CONSTANTS_FILE"
+    printf '%s\n' "$CONSTANTS_FILE"
+    return
+  fi
+
+  while IFS= read -r -d '' f; do
+    candidates+=("$f")
+  done < <(find "$DEFAULT_INSTALL_ROOT" -type f -path '*/site-packages/pritunl/constants.py' -print0 2>/dev/null)
+
+  if ((${#candidates[@]} == 0)); then
+    die "No Pritunl constants.py file was found under ${DEFAULT_INSTALL_ROOT}. Use --constants-file."
+  fi
+  if ((${#candidates[@]} > 1)); then
+    printf 'Multiple candidate files were found:\n' >&2
+    printf '  %s\n' "${candidates[@]}" >&2
+    die "Refusing to guess. Use --constants-file."
+  fi
+  printf '%s\n' "${candidates[0]}"
+}
+
+python_executable() {
+  local constants="$1" pyroot py
+  pyroot="${constants%%/site-packages/*}"
+  py="${pyroot%/lib}/bin/python3"
+  if [[ -x "$py" ]]; then
+    printf '%s\n' "$py"
+  else
+    command -v python3 || die "Python 3 is required."
+  fi
+}
+
+inspect_templates() {
+  local constants="$1"
+  python3 - "$constants" <<'PY'
+import ast, re, sys
+path = sys.argv[1]
+source = open(path, encoding="utf-8").read()
+tree = ast.parse(source, filename=path)
+values = {}
+for node in tree.body:
+    if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+        name = node.targets[0].id
+        if name in {"KEY_LINK_EMAIL_TEXT", "KEY_LINK_EMAIL_HTML"}:
+            if name in values:
+                raise SystemExit(f"ERROR: {name} appears more than once")
+            values[name] = ast.literal_eval(node.value)
+missing = {"KEY_LINK_EMAIL_TEXT", "KEY_LINK_EMAIL_HTML"} - values.keys()
+if missing:
+    raise SystemExit("ERROR: Missing expected template(s): " + ", ".join(sorted(missing)))
+for name, value in values.items():
+    for placeholder in ("{key_link}", "{uri_link}"):
+        if placeholder not in value:
+            raise SystemExit(f"ERROR: {name} is missing {placeholder}")
+text = values["KEY_LINK_EMAIL_TEXT"]
+html = values["KEY_LINK_EMAIL_HTML"]
+text_match = re.search(r"(?m)^Need help setting up your VPN\?\nVPN Setup Guide: (https?://\S+)\n?$", text)
+html_match = re.search(r"<!-- ECE-PRITUNL-HELP-START -->.*?<a href=\"([^\"]+)\">View the VPN Setup Guide</a>.*?<!-- ECE-PRITUNL-HELP-END -->", html, re.S)
+if bool(text_match) != bool(html_match):
+    raise SystemExit("ERROR: Managed markers are present in only one template; manual review is required")
+if text_match and html_match and text_match.group(1) != html_match.group(1):
+    raise SystemExit("ERROR: Text and HTML templates contain different managed URLs")
+if text_match:
+    print("configured\t" + text_match.group(1))
+else:
+    print("absent\t")
+PY
+}
+
+patch_templates() {
+  local source="$1" output="$2" url="$3"
+  python3 - "$source" "$output" "$url" <<'PY'
+import ast, re, sys
+src_path, out_path, url = sys.argv[1:]
+source = open(src_path, encoding="utf-8").read()
+tree = ast.parse(source, filename=src_path)
+assignments = {}
+for node in tree.body:
+    if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+        name = node.targets[0].id
+        if name in {"KEY_LINK_EMAIL_TEXT", "KEY_LINK_EMAIL_HTML"}:
+            if name in assignments:
+                raise SystemExit(f"{name} appears more than once")
+            assignments[name] = node
+if set(assignments) != {"KEY_LINK_EMAIL_TEXT", "KEY_LINK_EMAIL_HTML"}:
+    raise SystemExit("Expected Pritunl email templates were not found")
+
+text = ast.literal_eval(assignments["KEY_LINK_EMAIL_TEXT"].value)
+html = ast.literal_eval(assignments["KEY_LINK_EMAIL_HTML"].value)
+for name, value in (("KEY_LINK_EMAIL_TEXT", text), ("KEY_LINK_EMAIL_HTML", html)):
+    for placeholder in ("{key_link}", "{uri_link}"):
+        if placeholder not in value:
+            raise SystemExit(f"{name} is missing {placeholder}")
+
+text_block = f"Need help setting up your VPN?\nVPN Setup Guide: {url}\n"
+html_block = (
+    '<!-- ECE-PRITUNL-HELP-START -->\n'
+    '<p><strong>Need help setting up your VPN?</strong><br>\n'
+    f'<a href="{url}">View the VPN Setup Guide</a></p>\n'
+    '<!-- ECE-PRITUNL-HELP-END -->\n'
+)
+text_pattern = re.compile(r"(?m)^Need help setting up your VPN\?\nVPN Setup Guide: https?://\S+\n?")
+html_pattern = re.compile(r"<!-- ECE-PRITUNL-HELP-START -->.*?<!-- ECE-PRITUNL-HELP-END -->\n?", re.S)
+text = text_pattern.sub("", text).rstrip() + "\n\n" + text_block
+html = html_pattern.sub("", html).rstrip() + "\n\n" + html_block
+
+lines = source.splitlines(keepends=True)
+replacements = []
+for name, value in (("KEY_LINK_EMAIL_TEXT", text), ("KEY_LINK_EMAIL_HTML", html)):
+    node = assignments[name]
+    start = node.lineno - 1
+    end = node.end_lineno
+    replacements.append((start, end, f"{name} = {value!r}\n"))
+for start, end, replacement in sorted(replacements, reverse=True):
+    lines[start:end] = [replacement]
+new_source = "".join(lines)
+ast.parse(new_source, filename=out_path)
+open(out_path, "w", encoding="utf-8").write(new_source)
+PY
+}
+
+validate_python() {
+  local py="$1" file="$2"
+  "$py" -m py_compile "$file"
+}
+
+restart_pritunl() {
+  command -v systemctl >/dev/null 2>&1 || die "systemctl is required to restart Pritunl."
+  log "Restarting ${SERVICE_NAME}.service..."
+  systemctl restart "$SERVICE_NAME"
+  local deadline=$((SECONDS + 120))
+  until systemctl is-active --quiet "$SERVICE_NAME"; do
+    (( SECONDS < deadline )) || die "Pritunl did not become active within 120 seconds."
+    sleep 2
+  done
+  log "Pritunl is active."
+}
+
+list_backups() {
+  require_root
+  if [[ ! -d "$BACKUP_DIR" ]]; then
+    log "No backup directory exists: $BACKUP_DIR"
+    exit 0
+  fi
+  find "$BACKUP_DIR" -maxdepth 1 -type f -name 'constants.py.*' -printf '%TY-%Tm-%Td %TH:%TM:%TS  %p\n' | sort -r
+}
+
+restore_backup() {
+  require_root
+  [[ -f "$RESTORE_FILE" ]] || die "Backup file not found: $RESTORE_FILE"
+  local constants py temp safety
+  constants="$(find_constants_file)"
+  py="$(python_executable "$constants")"
+  validate_python "$py" "$RESTORE_FILE" || die "The selected backup is not valid Python."
+  inspect_templates "$RESTORE_FILE" >/dev/null || die "The selected backup does not contain valid Pritunl templates."
+  confirm "Restore ${RESTORE_FILE} over ${constants}?" || die "Restore cancelled."
+  mkdir -p "$BACKUP_DIR" && chmod 0700 "$BACKUP_DIR"
+  safety="${BACKUP_DIR}/constants.py.pre-restore.$(date +%F-%H%M%S)"
+  cp -a "$constants" "$safety"
+  temp="$(mktemp "${constants}.restore.XXXXXX")"
+  cp -a "$RESTORE_FILE" "$temp"
+  chown --reference="$constants" "$temp"
+  chmod --reference="$constants" "$temp"
+  mv -f "$temp" "$constants"
+  log "Restore completed. Safety backup: $safety"
+  if [[ "$RESTART_MODE" == restart ]] || { [[ "$RESTART_MODE" == prompt ]] && confirm "Restart Pritunl now?"; }; then
+    restart_pritunl
+  fi
+}
+
+parse_args() {
+  while (($#)); do
+    case "$1" in
+      --url) (($# >= 2)) || die "--url requires a value"; URL="$2"; shift 2 ;;
+      --check) MODE="check"; shift ;;
+      --restart) RESTART_MODE="restart"; shift ;;
+      --no-restart) RESTART_MODE="no-restart"; shift ;;
+      --constants-file) (($# >= 2)) || die "--constants-file requires a path"; CONSTANTS_FILE="$2"; shift 2 ;;
+      --list-backups) MODE="list"; shift ;;
+      --restore) (($# >= 2)) || die "--restore requires a path"; MODE="restore"; RESTORE_FILE="$2"; shift 2 ;;
+      --yes|-y) ASSUME_YES=true; shift ;;
+      --version) printf '%s %s\n' "$PROGRAM" "$VERSION"; exit 0 ;;
+      --help|-h) usage; exit 0 ;;
+      *) die "Unknown option: $1" ;;
+    esac
+  done
+}
+
+main() {
+  parse_args "$@"
+  [[ "$MODE" == list ]] && { list_backups; exit 0; }
+  [[ "$MODE" == restore ]] && { restore_backup; exit 0; }
+
+  require_root
+  command -v python3 >/dev/null 2>&1 || die "Python 3 is required."
+  local constants py state current_url normalized backup temp
+  constants="$(find_constants_file)"
+  py="$(python_executable "$constants")"
+  log "Pritunl constants file: $constants"
+
+  IFS=$'\t' read -r state current_url < <(inspect_templates "$constants")
+  if [[ "$MODE" == check ]]; then
+    if [[ "$state" == configured ]]; then
+      log "Customization is installed: $current_url"
+    else
+      log "Customization is not installed."
+    fi
+    exit 0
+  fi
+
+  if [[ -z "$URL" ]]; then
+    read -r -p "Enter the VPN setup guide hostname or URL: " URL
+  fi
+  normalized="$(normalize_url "$URL")" || die "Invalid URL."
+  log "Help URL: $normalized"
+
+  if [[ "$state" == configured && "$current_url" == "$normalized" ]]; then
+    log "The same URL is already configured. No changes are required."
+    exit 0
+  fi
+
+  confirm "Apply this customization to Pritunl?" || die "Operation cancelled."
+  mkdir -p "$BACKUP_DIR"
+  chmod 0700 "$BACKUP_DIR"
+  backup="${BACKUP_DIR}/constants.py.$(date +%F-%H%M%S)"
+  cp -a "$constants" "$backup"
+  log "Backup created: $backup"
+
+  temp="$(mktemp "${constants}.new.XXXXXX")"
+  trap 'rm -f -- "${temp:-}"' EXIT
+  patch_templates "$constants" "$temp" "$normalized"
+  validate_python "$py" "$temp" || die "Modified file failed Python validation; original was not changed."
+  IFS=$'\t' read -r state current_url < <(inspect_templates "$temp")
+  [[ "$state" == configured && "$current_url" == "$normalized" ]] || die "Post-change verification failed; original was not changed."
+  chown --reference="$constants" "$temp"
+  chmod --reference="$constants" "$temp"
+  mv -f "$temp" "$constants"
+  trap - EXIT
+  log "Pritunl onboarding email templates updated successfully."
+
+  case "$RESTART_MODE" in
+    restart) restart_pritunl ;;
+    no-restart) log "Pritunl was not restarted. Restart it later for the change to take effect." ;;
+    prompt)
+      if confirm "Restart Pritunl now? Existing VPN connections may be interrupted."; then
+        restart_pritunl
+      else
+        log "Pritunl was not restarted. Restart it later for the change to take effect."
+      fi
+      ;;
+  esac
+}
+
+main "$@"
